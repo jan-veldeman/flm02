@@ -56,6 +56,7 @@ local WAN_ENABLED	= (FLUKSO.daemon.enable_wan_branch == '1')
 
 local TIMESTAMP_MIN	= 1234567890
 local WAN_INTERVAL	= 300
+local WAN_LOG		= "wan" -- string, nil to disable log messages
 
 local WAN_FILTER = { [1] = {}, [2] = {}, [3] = {} }
 WAN_FILTER[1].span	= 60
@@ -90,6 +91,28 @@ local LAN_FACTOR	= { ['electricity'] =      3.6e6,	-- 1 Wh/ms = 3.6e6 W
 local LAN_ID_TO_FACTOR	= { }
 uci:foreach('flukso', 'sensor', function(x) LAN_ID_TO_FACTOR[x.id] = LAN_FACTOR[x['type']] end)
 
+-- set Pachube parameters
+FLUKSO.pachube = FLUKSO.pachube or {}
+local PACHUBE_ENABLED	= (FLUKSO.daemon.enable_pachube_branch == '1')
+
+local PACHUBE_LIMIT	= 500 -- max allowed datapoints per POST
+local PACHUBE_FILTER	= {
+	['span'] = FLUKSO.pachube.span or 1,
+	['offset'] = 0,
+}
+local PACHUBE_INTERVAL	= FLUKSO.pachube.interval or 30
+local PACHUBE_LOG	= nil -- string, nil to disable logging
+
+local PACHUBE_FEED_ID	= FLUKSO.pachube.feedid
+local PACHUBE_API_KEY	= FLUKSO.pachube.key
+local PACHUBE_DATA_STREAMS	= { }
+uci:foreach('flukso', 'sensor', function(x)
+	port = tonumber((x['port'] or {})[1])
+	if(port) then
+		PACHUBE_DATA_STREAMS[port] = x['pachube_stream']
+	end
+end)
+
 function resume(...)
 	local status, err = coroutine.resume(...)
 
@@ -98,7 +121,7 @@ function resume(...)
 	end
 end
 
-function dispatch(wan_child, lan_child)
+function dispatch(wan_child, lan_child, pachube_child)
 	return coroutine.create(function()
 		local delta = { fdin  = nixio.open(DELTA_PATH_IN, O_RDWR_NONBLOCK),
                                 fdout = nixio.open(DELTA_PATH_OUT, O_RDWR) }
@@ -148,15 +171,20 @@ function dispatch(wan_child, lan_child)
 						resume(lan_child, sensor_id, timestamp, false, counter, extra)
 					end
 				end
+
+				if PACHUBE_ENABLED and PACHUBE_DATA_STREAMS[tolua(i)] then
+					-- currently only analog supported! TODO
+					resume(pachube_child, PACHUBE_DATA_STREAMS[tolua(i)], timestamp, extra)
+				end
 			end 
 		end
 	end)
 end
 
-function wan_buffer(child)
+function wan_buffer(child, interval, log)
 	return coroutine.create(function(sensor_id, timestamp, counter)
 		local measurements = data.new()
-		local threshold = os.time() + WAN_INTERVAL
+		local threshold = os.time() + interval
 		local previous = {}
 
 		while true do
@@ -172,7 +200,9 @@ function wan_buffer(child)
 				and counter ~= (previous[sensor_id].counter or 0) 
 				then
 
-				nixio.syslog('info', string.format('processed pulse %s:%s:%s', sensor_id, timestamp, counter))
+				if log then
+					nixio.syslog('info', string.format('processed pulse %s:%s:%s on %s', sensor_id, timestamp, counter, log))
+				end
 	
 				measurements:add(sensor_id, timestamp, counter)
 				previous[sensor_id].timestamp = timestamp
@@ -181,7 +211,7 @@ function wan_buffer(child)
 
 			if timestamp > threshold and next(measurements) then  --checking whether table is not empty
 				resume(child, measurements)
-				threshold = os.time() + WAN_INTERVAL
+				threshold = os.time() + interval
 			end
 
 			sensor_id, timestamp, counter = coroutine.yield()
@@ -359,6 +389,84 @@ function publish(child)
 	end)
 end
 
+function limit(child, max_points)
+	return coroutine.create(function(measurements)
+		while true do
+			measurements:limit(max_points)
+			resume(child, measurements)
+			measurements = coroutine.yield()
+		end
+	end)
+end
+
+function pachube_send(child)
+	return coroutine.create(function(measurements)
+		local headers = {}
+		headers['User-Agent'] = USER_AGENT
+		headers['X-PachubeApiKey'] = PACHUBE_API_KEY
+
+		local options = {}
+		options.protocol = "HTTP/1.1"
+		options.sndtimeo = 5
+		options.rcvtimeo = 5
+		options.method  = 'POST'
+		options.headers = headers
+
+		while true do
+			local sensors = measurements:get_sensors()
+			local measurements_pachube = measurements:pachube_encode()
+			local http_persist = httpclient.create_persistent()
+
+			for i, sensor_id in ipairs(sensors) do
+				if i ~= #sensors then
+					options.headers['Connection'] = 'keep-alive'
+				else
+					options.headers['Connection'] = 'close'
+				end
+
+				options.body = '{"datapoints":' .. measurements_pachube[sensor_id] .. '}\n'
+				options.headers['Content-Length'] = tostring(#options.body)
+
+				local url = string.format("http://api.pachube.com/v2/feeds/%d/datastreams/%s/datapoints",
+					PACHUBE_FEED_ID,
+					sensor_id
+					)
+				local response, code, call_info = http_persist(url, options)
+
+				local level
+
+				-- flush the sensor's measurement buffer in case of a successful HTTP POST
+				if code == 200 then
+					measurements:clear(sensor_id)
+					level = 'info'
+				else
+					level = 'err'
+				end
+
+				nixio.syslog(level, string.format('%s %s: %s', options.method, url, code))
+
+				-- if available, send additional error info to the syslog
+				if type(call_info) == 'string' then
+					nixio.syslog('err', call_info)
+				elseif type(call_info) == 'table'  then
+					local auth_error = call_info.headers['WWW-Authenticate']
+
+					if auth_error then
+						nixio.syslog('err', string.format('WWW-Authenticate: %s', auth_error))
+					end
+				end
+			end
+
+			-- allow coroutine to be gc'ed
+			http_persist = nil
+
+			resume(child, measurements)
+			measurements = coroutine.yield()
+		end
+	end)
+end
+
+
 function debug(child)
 	return coroutine.create(function(measurements)
 		while true do
@@ -388,7 +496,7 @@ local wan_chain =
 				, WAN_FILTER[3].span, WAN_FILTER[3].offset)
 			, WAN_FILTER[2].span, WAN_FILTER[2].offset)
 		, WAN_FILTER[1].span, WAN_FILTER[1].offset)
-	)
+	, WAN_INTERVAL, WAN_LOG)
 
 local lan_chain =
 	lan_buffer(
@@ -397,6 +505,19 @@ local lan_chain =
 		)
 	)
 
-local chain = dispatch(wan_chain, lan_chain)
+local pachube_chain =
+	wan_buffer(
+		filter(
+			limit(
+				pachube_send(
+					gc(
+						debug(nil)
+					)
+				)
+			, PACHUBE_LIMIT)
+		, PACHUBE_FILTER.span, PACHUBE_FILTER.offset)
+	, PACHUBE_INTERVAL, PACHUBE_LOG)
+
+local chain = dispatch(wan_chain, lan_chain, pachube_chain)
 
 resume(chain)

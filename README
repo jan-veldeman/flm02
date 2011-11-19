@@ -50,3 +50,62 @@ tools: a set of helper tools for flashing, generating boardconfigs, etc.
 $forum = www.flukso.net/forum
 $mailing_list = flukso-dev-join@lists.flukso.net
 $irc = #flukso on freenode
+
+#####
+
+This pachube branch of flukso enables sending your power
+consumption to pachube (in addition to the standard flukso.net)
+
+https://pachube.com
+
+The implementation is still incomplete:
+* only for analog readings
+* no luci web interface; command line settings needed
+* not yet documented in user manual
+  (should be done after luci implementation)
+* using http instead of https
+
+
+Getting started
+---------------
+
+* Create a pachube account.
+* Create a new feed, e.g. "Flukso",
+  write down the feed id (number after feeds/)
+  In the example below 1234 will be used as feed id.
+  Note: you could make your feed private (default public)
+* In this feed, create a stream, e.g. "main"
+* Under "My keys", create a new API key with POST
+  permissions.
+  If your feed is private, make sure to grant access
+  to private feeds with this key.
+
+
+Minimal required settings
+-------------------------
+
+uci set flukso.daemon.enable_pachube_branch=1
+uci set flukso.pachube=settings
+uci set flukso.pachube.key=<apikey>
+uci set flukso.pachube.feedid=<feedid>
+uci set flukso.1.pachube_stream=<stream>
+
+with <feedid>, <stream> and <apikey> replaced with the information
+above, e.g. 1234 and main
+And assuming your sensor is attached to port 1.
+
+
+Advanced tweaking
+-----------------
+
+flukso.pachube.span:
+    Aggregate readings per <span> seconds.
+    default 1: all readings will be send
+flukso.pachube.interval:
+    Number of seconds between uploading data.
+    This should not be too high, because only 500
+    data points per post are allowed.
+    default 30
+
+
+
